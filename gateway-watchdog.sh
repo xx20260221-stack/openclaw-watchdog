@@ -78,7 +78,8 @@ except: print('ok')
     exit 0
   fi
 
-  # RPC failed — restart
+  # RPC failed — try doctor --fix first, then restart
+  $OPENCLAW doctor --fix >> "$LOG" 2>&1
   $OPENCLAW gateway restart >> "$LOG" 2>&1
   sleep 3
   CHECK=$($OPENCLAW gateway status 2>&1)
