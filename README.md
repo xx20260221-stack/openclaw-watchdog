@@ -4,13 +4,14 @@
 
 ## 功能
 
+- 基于本地端口监听 + HTTP 探测判断健康（不依赖 `openclaw gateway status` 文案）
 - 进程崩溃后自动重启网关
 - launchd 服务未加载时自动重新注册并启动
 - 端口被其他进程占用时强杀后重启
 - 配置存在无效字段时自动运行 `openclaw doctor --fix` 修复
-- 修复失败时自动回滚到上次正常运行的配置备份
-- 检测默认模型是否有效，无效时自动回滚配置
+- 修复失败时自动回滚到**已校验有效**的配置备份（避免回滚坏备份）
 - 网关日志超过 5MB 时自动截断
+- 单实例文件锁，防止并发自愈互相干扰
 - 所有检测到的问题、采取的措施、处理结果均记录到日志
 
 ## 环境要求
@@ -35,6 +36,7 @@ chmod +x ~/.openclaw/workspace/scripts/gateway-watchdog.sh
 ## 日志
 
 所有 watchdog 事件写入 `~/.openclaw/logs/watchdog.log`：
+锁文件为 `~/.openclaw/.watchdog/watchdog.lock`。
 
 ```
 2026-02-27 11:36:32 [问题] 进程运行但RPC无响应 | [措施] 重启网关 | [结果] 成功
@@ -53,11 +55,10 @@ chmod +x ~/.openclaw/workspace/scripts/gateway-watchdog.sh
 ├── 启动失败 → doctor --fix → 重启
 └── 仍然失败 → 回滚到上次正常配置 → 重启
 
-网关运行但 RPC 无响应？
-└── 重启网关
+网关进程在但服务不可用（端口/HTTP异常）？
+└── 重启网关（失败则清理僵尸进程后拉起）
 
 网关运行且 RPC 正常？
-├── 默认模型不在可用列表 → 回滚配置 → 重启
 └── 一切正常 → 保存当前配置为备份
 ```
 

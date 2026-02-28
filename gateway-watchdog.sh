@@ -1,28 +1,30 @@
 #!/bin/bash
-# Gateway watchdog — restart if process is dead or RPC probe fails
-# Also handles port conflicts, log rotation, config backup/rollback
+# Gateway watchdog v2
+# - Health check based on local listener + HTTP probe (avoids fragile CLI text parsing)
+# - Auto-repair known config breakages (e.g. invalid typingMode)
+# - Rollback only when backup itself is validated
+# - Single-instance lock to avoid overlapping recoveries
 
-# Auto-detect paths
+set -u
+
 export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/bin:/bin:$PATH"
 
 OPENCLAW=$(command -v openclaw 2>/dev/null)
-if [ -z "$OPENCLAW" ]; then
-  echo "$(date '+%Y-%m-%d %H:%M:%S') [错误] openclaw 命令未找到，请检查 PATH" >> "$HOME/.openclaw/logs/watchdog.log"
-  exit 1
-fi
-
 OPENCLAW_DIR="$HOME/.openclaw"
-LOG="$OPENCLAW_DIR/logs/watchdog.log"
 LOG_DIR="$OPENCLAW_DIR/logs"
+LOG="$LOG_DIR/watchdog.log"
 CONFIG="$OPENCLAW_DIR/openclaw.json"
 CONFIG_BACKUP="$OPENCLAW_DIR/openclaw.json.watchdog-backup"
 PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
+STATE_DIR="$OPENCLAW_DIR/.watchdog"
+LOCK_FILE="$STATE_DIR/watchdog.lock"
+USER_UID=$(id -u)
 
-# Auto-detect port from config (use jq if available, fallback to python3, then default)
-if command -v jq &>/dev/null; then
-  PORT=$(jq -r '.gateway.port // 18789' "$CONFIG" 2>/dev/null || echo 18789)
-else
-  PORT=$(python3 -c "import json; d=json.load(open('$CONFIG')); print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789)
+mkdir -p "$LOG_DIR" "$STATE_DIR"
+
+if [ -z "${OPENCLAW:-}" ]; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [错误] openclaw 命令未找到，请检查 PATH" >> "$LOG"
+  exit 1
 fi
 
 log() {
@@ -30,138 +32,362 @@ log() {
 }
 
 log_event() {
-  local problem=$1
-  local action=$2
-  local result=$3
+  local problem="$1"
+  local action="$2"
+  local result="$3"
   echo "$(date '+%Y-%m-%d %H:%M:%S') [问题] $problem | [措施] $action | [结果] $result" >> "$LOG"
 }
 
-# Log rotation: if log > 5MB, truncate oldest content
+trim_text() {
+  echo "$1" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-320
+}
+
+run_cmd_logged() {
+  local label="$1"
+  shift
+  local out rc
+  out="$("$@" 2>&1)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    log "[命令失败] $label (exit=$rc): $(trim_text "$out")"
+  fi
+  return "$rc"
+}
+
+cleanup_lock() {
+  if [ -f "$LOCK_FILE" ]; then
+    local lock_pid
+    lock_pid=$(awk 'NR==1{print $1}' "$LOCK_FILE" 2>/dev/null || echo "")
+    if [ "$lock_pid" = "$$" ]; then
+      rm -f "$LOCK_FILE" 2>/dev/null || true
+    fi
+  fi
+}
+
+acquire_lock() {
+  # Atomic lock file using noclobber
+  if ( set -o noclobber; echo "$$ $(date +%s)" > "$LOCK_FILE" ) 2>/dev/null; then
+    trap cleanup_lock EXIT INT TERM
+    return 0
+  fi
+
+  # Stale lock protection (dead pid or lock older than 10 minutes)
+  local now lock_pid lock_ts age
+  now=$(date +%s)
+  lock_pid=$(awk 'NR==1{print $1}' "$LOCK_FILE" 2>/dev/null || echo "")
+  lock_ts=$(awk 'NR==1{print $2}' "$LOCK_FILE" 2>/dev/null || echo 0)
+  if ! echo "$lock_ts" | grep -Eq '^[0-9]+$'; then
+    lock_ts=0
+  fi
+  age=$((now - lock_ts))
+
+  if [ -n "$lock_pid" ] && ! kill -0 "$lock_pid" 2>/dev/null; then
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+    if ( set -o noclobber; echo "$$ $(date +%s)" > "$LOCK_FILE" ) 2>/dev/null; then
+      log_event "检测到死锁进程(pid=${lock_pid})" "清理旧锁并继续" "成功"
+      trap cleanup_lock EXIT INT TERM
+      return 0
+    fi
+  fi
+
+  if [ "$lock_ts" -gt 0 ] && [ "$age" -gt 600 ]; then
+    rm -f "$LOCK_FILE" 2>/dev/null || true
+    if ( set -o noclobber; echo "$$ $(date +%s)" > "$LOCK_FILE" ) 2>/dev/null; then
+      log_event "检测到过期锁(age=${age}s)" "清理旧锁并继续" "成功"
+      trap cleanup_lock EXIT INT TERM
+      return 0
+    fi
+  fi
+
+  log "已有watchdog实例运行(pid=${lock_pid:-unknown})，跳过本轮"
+  return 1
+}
+
 rotate_if_needed() {
-  local file=$1
+  local file="$1"
   local max_bytes=$((5 * 1024 * 1024))
+  local keep_bytes=$((1 * 1024 * 1024))
   local size
-  # macOS: stat -f%z, Linux: stat -c%s
-  if stat -f%z "$file" &>/dev/null; then
+
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  if stat -f%z "$file" >/dev/null 2>&1; then
     size=$(stat -f%z "$file" 2>/dev/null || echo 0)
   else
     size=$(stat -c%s "$file" 2>/dev/null || echo 0)
   fi
-  if [ -f "$file" ] && [ "$size" -gt "$max_bytes" ]; then
-    tail -c $((1 * 1024 * 1024)) "$file" > "$file.tmp" && mv "$file.tmp" "$file"
+  if [ "$size" -gt "$max_bytes" ]; then
+    tail -c "$keep_bytes" "$file" > "$file.tmp" && mv "$file.tmp" "$file"
     log_event "日志文件超过5MB: $file" "截断保留最新1MB" "完成"
   fi
 }
 
+get_port() {
+  local p
+  if command -v jq >/dev/null 2>&1; then
+    p=$(jq -r '.gateway.port // 18789' "$CONFIG" 2>/dev/null || echo 18789)
+  else
+    p=$(python3 -c "import json; d=json.load(open('$CONFIG')); print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789)
+  fi
+  if echo "$p" | grep -Eq '^[0-9]+$'; then
+    echo "$p"
+  else
+    echo 18789
+  fi
+}
+
+is_typing_mode_valid() {
+  case "$1" in
+    ""|never|instant|thinking|message) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+config_quick_validate() {
+  local file="$1"
+  local mode
+  [ -f "$file" ] || return 1
+  jq empty "$file" >/dev/null 2>&1 || return 1
+  mode=$(jq -r '.agents.defaults.typingMode // empty' "$file" 2>/dev/null || echo "")
+  is_typing_mode_valid "$mode"
+}
+
+sanitize_known_config_issues() {
+  local file="$1"
+  local label="$2"
+  local mode tmp
+
+  [ -f "$file" ] || return 1
+  jq empty "$file" >/dev/null 2>&1 || return 1
+
+  mode=$(jq -r '.agents.defaults.typingMode // empty' "$file" 2>/dev/null || echo "")
+  if ! is_typing_mode_valid "$mode"; then
+    tmp="$file.tmp.$$"
+    if jq '.agents.defaults.typingMode = "message"' "$file" > "$tmp" && mv "$tmp" "$file"; then
+      log_event "${label}配置typingMode非法(${mode})" "自动修正为message" "成功"
+      chmod 600 "$file" 2>/dev/null || true
+    else
+      rm -f "$tmp"
+      log_event "${label}配置typingMode非法(${mode})" "自动修正为message" "失败"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+listener_pid() {
+  lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -Fp 2>/dev/null | sed -n 's/^p//p' | head -1
+}
+
+listener_command() {
+  local pid="$1"
+  ps -p "$pid" -o command= 2>/dev/null
+}
+
+is_openclaw_listener_cmd() {
+  echo "$1" | grep -Eq 'openclaw-gateway|openclaw/dist/index\.js.* gateway|openclaw\.mjs.*gateway|[ /]openclaw gateway'
+}
+
+is_port_listening() {
+  [ -n "$(listener_pid)" ]
+}
+
+http_probe_once() {
+  local code
+  code=$(curl -sS -m 4 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/" 2>/dev/null || echo 000)
+  [ "$code" != "000" ]
+}
+
+probe_gateway_ready() {
+  local i
+  for i in 1 2 3 4 5; do
+    if is_port_listening && http_probe_once; then
+      return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+service_loaded() {
+  launchctl print "gui/${USER_UID}/ai.openclaw.gateway" >/dev/null 2>&1
+}
+
+openclaw_gateway_pids() {
+  ps -axo pid=,command= | awk '
+    $0 ~ /openclaw-gateway/ || $0 ~ /openclaw\/dist\/index\.js .*gateway/ {
+      print $1
+    }
+  '
+}
+
+refresh_backup_if_safe() {
+  if config_quick_validate "$CONFIG"; then
+    cp "$CONFIG" "$CONFIG_BACKUP" 2>/dev/null || return 1
+    chmod 600 "$CONFIG" "$CONFIG_BACKUP" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+recover_config() {
+  sanitize_known_config_issues "$CONFIG" "当前" || true
+  if config_quick_validate "$CONFIG"; then
+    return 0
+  fi
+
+  run_cmd_logged "openclaw doctor --fix" "$OPENCLAW" doctor --fix || true
+  sanitize_known_config_issues "$CONFIG" "当前" || true
+  if config_quick_validate "$CONFIG"; then
+    log_event "检测到当前配置无效" "doctor --fix/自动修正" "成功"
+    return 0
+  fi
+
+  if [ -f "$CONFIG_BACKUP" ]; then
+    sanitize_known_config_issues "$CONFIG_BACKUP" "备份" || true
+    if config_quick_validate "$CONFIG_BACKUP"; then
+      cp "$CONFIG_BACKUP" "$CONFIG" 2>/dev/null
+      chmod 600 "$CONFIG" 2>/dev/null || true
+      log_event "检测到当前配置无效" "回滚到已校验备份" "成功"
+      return 0
+    fi
+    log_event "检测到当前配置无效" "备份校验失败，拒绝回滚" "失败"
+  else
+    log_event "检测到当前配置无效" "无备份可回滚" "失败"
+  fi
+
+  return 1
+}
+
+start_gateway() {
+  run_cmd_logged "openclaw gateway start" "$OPENCLAW" gateway start || true
+  probe_gateway_ready && return 0
+
+  if [ -f "$PLIST" ]; then
+    run_cmd_logged "launchctl kickstart" launchctl kickstart -k "gui/${USER_UID}/ai.openclaw.gateway" || true
+    probe_gateway_ready && return 0
+
+    if ! service_loaded; then
+      run_cmd_logged "launchctl bootstrap" launchctl bootstrap "gui/${USER_UID}" "$PLIST" || true
+      run_cmd_logged "launchctl kickstart(bootstrap后)" launchctl kickstart -k "gui/${USER_UID}/ai.openclaw.gateway" || true
+      probe_gateway_ready && return 0
+    fi
+  fi
+
+  run_cmd_logged "openclaw gateway start --force" "$OPENCLAW" gateway start --force || true
+  probe_gateway_ready
+}
+
+restart_gateway() {
+  run_cmd_logged "openclaw gateway restart --force" "$OPENCLAW" gateway restart --force || true
+  probe_gateway_ready && return 0
+
+  # fallback: if openclaw listener process exists but is unhealthy, terminate it then start fresh
+  local pid cmd
+  pid=$(listener_pid)
+  if [ -n "$pid" ]; then
+    cmd=$(listener_command "$pid")
+    if is_openclaw_listener_cmd "$cmd"; then
+      kill -15 "$pid" 2>/dev/null || true
+      sleep 2
+      if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null || true
+        sleep 1
+      fi
+    fi
+  fi
+
+  start_gateway
+}
+
+kill_conflict_listener() {
+  local pid="$1"
+  kill -15 "$pid" 2>/dev/null || true
+  sleep 2
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+kill_stale_gateway_processes() {
+  local pids pid
+  pids=$(openclaw_gateway_pids)
+  [ -n "${pids}" ] || return 0
+  for pid in $pids; do
+    kill -15 "$pid" 2>/dev/null || true
+  done
+  sleep 2
+  for pid in $pids; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+  done
+  sleep 1
+  return 0
+}
+
+acquire_lock || exit 0
+
 rotate_if_needed "$LOG_DIR/gateway.log"
 rotate_if_needed "$LOG_DIR/gateway.err.log"
+rotate_if_needed "$LOG"
 
-STATUS=$($OPENCLAW gateway status 2>&1)
+if [ ! -f "$CONFIG" ]; then
+  log_event "配置文件不存在: $CONFIG" "跳过本轮" "失败，需人工介入"
+  exit 1
+fi
 
-# Process alive and RPC ok — check model validity then backup
-if echo "$STATUS" | grep -q "Runtime: running"; then
-  if echo "$STATUS" | grep -q "RPC probe: ok"; then
-    # Validate default model is in allowed list
-    MODEL_CHECK=$($OPENCLAW models status --json 2>/dev/null | python3 -c "
-import json,sys
-try:
-  d=json.load(sys.stdin)
-  default=d.get('defaultModel','')
-  allowed=d.get('allowed',[])
-  print('ok' if default in allowed else 'invalid:'+default)
-except: print('ok')
-" 2>/dev/null)
-    if echo "$MODEL_CHECK" | grep -q "^invalid:"; then
-      BAD_MODEL=$(echo "$MODEL_CHECK" | sed 's/^invalid://')
-      # Rollback config to last known-good
-      if [ -f "$CONFIG_BACKUP" ]; then
-        cp "$CONFIG_BACKUP" "$CONFIG"
-        $OPENCLAW gateway restart >> "$LOG" 2>&1
-        sleep 4
-        log_event "默认模型不存在: $BAD_MODEL" "回滚配置并重启网关" "成功"
+sanitize_known_config_issues "$CONFIG" "当前" || true
+PORT=$(get_port)
+
+# Healthy path: local listener + HTTP response + listener is openclaw process.
+if is_port_listening; then
+  PID=$(listener_pid)
+  CMD=$(listener_command "$PID")
+  if is_openclaw_listener_cmd "$CMD" && probe_gateway_ready; then
+    refresh_backup_if_safe || true
+    exit 0
+  fi
+fi
+
+if is_port_listening; then
+  PID=$(listener_pid)
+  CMD=$(listener_command "$PID")
+
+  if ! is_openclaw_listener_cmd "$CMD"; then
+    if kill_conflict_listener "$PID"; then
+      recover_config || true
+      if start_gateway; then
+        refresh_backup_if_safe || true
+        log_event "端口${PORT}被非网关进程占用(PID ${PID})" "清理占用并启动网关" "成功"
       else
-        log_event "默认模型不存在: $BAD_MODEL" "无备份可回滚" "失败，需人工介入"
+        log_event "端口${PORT}被非网关进程占用(PID ${PID})" "清理占用并启动网关" "失败，需人工介入"
       fi
     else
-      # All good — save known-good config backup
-      cp "$CONFIG" "$CONFIG_BACKUP" 2>/dev/null
+      log_event "端口${PORT}被非网关进程占用(PID ${PID})" "终止占用进程" "失败，需人工介入"
     fi
     exit 0
   fi
 
-  # RPC failed — restart first, only run doctor --fix if restart doesn't help
-  $OPENCLAW gateway restart >> "$LOG" 2>&1
-  sleep 5
-  CHECK=$($OPENCLAW gateway status 2>&1)
-  if echo "$CHECK" | grep -q "RPC probe: ok"; then
-    log_event "进程运行但RPC无响应" "重启网关" "成功"
+  recover_config || true
+  if restart_gateway; then
+    refresh_backup_if_safe || true
+    log_event "网关进程存在但服务不可用(PID ${PID})" "重启网关并自检" "成功"
   else
-    # Restart alone didn't fix it — try doctor --fix then restart again
-    $OPENCLAW doctor --fix >> "$LOG" 2>&1
-    $OPENCLAW gateway restart >> "$LOG" 2>&1
-    sleep 5
-    CHECK=$($OPENCLAW gateway status 2>&1)
-    if echo "$CHECK" | grep -q "RPC probe: ok"; then
-      log_event "进程运行但RPC无响应" "doctor --fix后重启网关" "成功"
-    else
-      log_event "进程运行但RPC无响应" "doctor --fix后重启网关" "失败，RPC仍不通"
-    fi
+    log_event "网关进程存在但服务不可用(PID ${PID})" "重启网关并自检" "失败，需人工介入"
   fi
+  exit 0
+fi
 
+# No listener on port
+recover_config || true
+kill_stale_gateway_processes
+if start_gateway; then
+  refresh_backup_if_safe || true
+  log_event "网关端口${PORT}未监听" "启动网关并自检" "成功"
 else
-  # Process not running
-  PORT_PID=$(lsof -ti :$PORT 2>/dev/null | head -1)
-  if [ -n "$PORT_PID" ]; then
-    # Graceful kill first, then force kill if needed
-    kill -15 "$PORT_PID" 2>/dev/null
-    sleep 2
-    if kill -0 "$PORT_PID" 2>/dev/null; then
-      kill -9 "$PORT_PID" 2>/dev/null
-      sleep 1
-    fi
-    $OPENCLAW gateway start >> "$LOG" 2>&1
-    sleep 3
-    CHECK=$($OPENCLAW gateway status 2>&1)
-    if echo "$CHECK" | grep -q "Runtime: running"; then
-      log_event "进程未运行，端口$PORT被PID $PORT_PID占用" "强杀占用进程并启动网关" "成功"
-    else
-      log_event "进程未运行，端口$PORT被PID $PORT_PID占用" "强杀占用进程并启动网关" "失败，进程仍未启动"
-    fi
-  else
-    # Check if launchd service is loaded
-    if echo "$STATUS" | grep -q "service not loaded\|Service not installed\|not loaded"; then
-      launchctl bootstrap gui/$UID "$PLIST" >> "$LOG" 2>&1
-      sleep 2
-    fi
-    $OPENCLAW gateway start >> "$LOG" 2>&1
-    sleep 3
-    CHECK=$($OPENCLAW gateway status 2>&1)
-    if echo "$CHECK" | grep -q "Runtime: running"; then
-      log_event "进程未运行" "重新加载LaunchAgent并启动网关" "成功"
-    else
-      # Try doctor --fix first
-      $OPENCLAW doctor --fix >> "$LOG" 2>&1
-      $OPENCLAW gateway restart >> "$LOG" 2>&1
-      sleep 5
-      CHECK2=$($OPENCLAW gateway status 2>&1)
-      if echo "$CHECK2" | grep -q "Runtime: running"; then
-        log_event "进程未运行，配置异常" "doctor --fix后重启网关" "成功"
-      else
-        # Rollback to last known-good config
-        if [ -f "$CONFIG_BACKUP" ]; then
-          cp "$CONFIG_BACKUP" "$CONFIG"
-          $OPENCLAW gateway restart >> "$LOG" 2>&1
-          sleep 5
-          CHECK3=$($OPENCLAW gateway status 2>&1)
-          if echo "$CHECK3" | grep -q "Runtime: running"; then
-            log_event "进程未运行，配置异常" "回滚配置并重启网关" "成功"
-          else
-            log_event "进程未运行，配置异常" "回滚配置并重启网关" "失败，需人工介入"
-          fi
-        else
-          log_event "进程未运行，配置异常" "doctor --fix后重启网关" "失败，无备份可回滚，需人工介入"
-        fi
-      fi
-    fi
-  fi
+  log_event "网关端口${PORT}未监听" "启动网关并自检" "失败，需人工介入"
 fi
