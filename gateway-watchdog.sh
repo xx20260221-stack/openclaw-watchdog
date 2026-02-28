@@ -7,7 +7,7 @@
 
 set -u
 
-export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/bin:/bin:$PATH"
+export PATH="/usr/local/bin:/opt/homebrew/bin:$HOME/.npm-global/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 OPENCLAW=$(command -v openclaw 2>/dev/null)
 OPENCLAW_DIR="$HOME/.openclaw"
@@ -24,6 +24,11 @@ mkdir -p "$LOG_DIR" "$STATE_DIR"
 
 if [ -z "${OPENCLAW:-}" ]; then
   echo "$(date '+%Y-%m-%d %H:%M:%S') [错误] openclaw 命令未找到，请检查 PATH" >> "$LOG"
+  exit 1
+fi
+
+if ! command -v lsof >/dev/null 2>&1; then
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [错误] lsof 命令未找到，无法执行端口健康检测" >> "$LOG"
   exit 1
 fi
 
@@ -125,7 +130,7 @@ rotate_if_needed() {
 
 get_port() {
   local p
-  if command -v jq >/dev/null 2>&1; then
+  if has_jq; then
     p=$(jq -r '.gateway.port // 18789' "$CONFIG" 2>/dev/null || echo 18789)
   else
     p=$(python3 -c "import json; d=json.load(open('$CONFIG')); print(d.get('gateway',{}).get('port',18789))" 2>/dev/null || echo 18789)
@@ -135,6 +140,94 @@ get_port() {
   else
     echo 18789
   fi
+}
+
+has_jq() {
+  command -v jq >/dev/null 2>&1 || return 1
+  jq --version >/dev/null 2>&1
+}
+
+json_validate_file() {
+  local file="$1"
+  [ -f "$file" ] || return 1
+  if has_jq; then
+    jq empty "$file" >/dev/null 2>&1
+  else
+    python3 - "$file" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    json.load(f)
+PY
+  fi
+}
+
+json_get_typing_mode() {
+  local file="$1"
+  if has_jq; then
+    jq -r '.agents.defaults.typingMode // empty' "$file" 2>/dev/null || echo ""
+  else
+    python3 - "$file" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    mode = data.get("agents", {}).get("defaults", {}).get("typingMode", "")
+    if mode is None:
+        mode = ""
+    print(mode)
+except Exception:
+    pass
+PY
+  fi
+}
+
+json_set_typing_mode_message() {
+  local file="$1"
+  local tmp="$file.tmp.$$"
+  if has_jq; then
+    jq '.agents.defaults.typingMode = "message"' "$file" > "$tmp" || {
+      rm -f "$tmp"
+      return 1
+    }
+  else
+    if ! python3 - "$file" "$tmp" <<'PY'
+import json
+import sys
+
+src, dst = sys.argv[1], sys.argv[2]
+
+with open(src, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+if not isinstance(data, dict):
+    raise SystemExit(1)
+
+agents = data.get("agents")
+if not isinstance(agents, dict):
+    agents = {}
+    data["agents"] = agents
+
+defaults = agents.get("defaults")
+if not isinstance(defaults, dict):
+    defaults = {}
+    agents["defaults"] = defaults
+
+defaults["typingMode"] = "message"
+
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+    then
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
+  mv "$tmp" "$file"
 }
 
 is_typing_mode_valid() {
@@ -147,28 +240,25 @@ is_typing_mode_valid() {
 config_quick_validate() {
   local file="$1"
   local mode
-  [ -f "$file" ] || return 1
-  jq empty "$file" >/dev/null 2>&1 || return 1
-  mode=$(jq -r '.agents.defaults.typingMode // empty' "$file" 2>/dev/null || echo "")
+  json_validate_file "$file" || return 1
+  mode=$(json_get_typing_mode "$file")
   is_typing_mode_valid "$mode"
 }
 
 sanitize_known_config_issues() {
   local file="$1"
   local label="$2"
-  local mode tmp
+  local mode
 
   [ -f "$file" ] || return 1
-  jq empty "$file" >/dev/null 2>&1 || return 1
+  json_validate_file "$file" || return 1
 
-  mode=$(jq -r '.agents.defaults.typingMode // empty' "$file" 2>/dev/null || echo "")
+  mode=$(json_get_typing_mode "$file")
   if ! is_typing_mode_valid "$mode"; then
-    tmp="$file.tmp.$$"
-    if jq '.agents.defaults.typingMode = "message"' "$file" > "$tmp" && mv "$tmp" "$file"; then
+    if json_set_typing_mode_message "$file"; then
       log_event "${label}配置typingMode非法(${mode})" "自动修正为message" "成功"
       chmod 600 "$file" 2>/dev/null || true
     else
-      rm -f "$tmp"
       log_event "${label}配置typingMode非法(${mode})" "自动修正为message" "失败"
       return 1
     fi
