@@ -406,6 +406,48 @@ EOL
   assert_file_not_contains "$log_file" "检测到当前配置无效" "without jq valid config should not be misdetected"
 }
 
+test_subagents_key_auto_sanitized() {
+  cat > "$HOME/.openclaw/openclaw.json" <<'EOL'
+{
+  "gateway": {"port": 18789},
+  "agents": {"defaults": {"typingMode": "message"}},
+  "subagents": {"legacy": true}
+}
+EOL
+
+  set_listener_state 0 0 none 0
+  run_watchdog
+
+  local has_subagents
+  has_subagents=$(jq -r 'has("subagents")' "$HOME/.openclaw/openclaw.json")
+  assert_eq false "$has_subagents" "watchdog should remove unsupported subagents key"
+
+  local log_file="$HOME/.openclaw/logs/watchdog.log"
+  assert_file_contains "$log_file" "自动移除subagents" "subagents auto-sanitize should be logged"
+}
+
+test_start_failure_triggers_doctor_fallback() {
+  set_listener_state 0 0 none 0
+  echo 1 > "$MOCK_STATE/start_exit_code"
+
+  run_watchdog
+
+  local starts doctors
+  starts=$(count_file_value "$MOCK_STATE/start_count")
+  doctors=$(count_file_value "$MOCK_STATE/doctor_count")
+  assert_eq 3 "$starts" "start fallback should attempt start three times when launcher keeps failing"
+  assert_eq 2 "$doctors" "start fallback should invoke doctor in preflight and fallback"
+}
+
+test_unhealthy_path_runs_generic_doctor_preflight() {
+  set_listener_state 0 0 none 0
+  run_watchdog
+
+  local doctors
+  doctors=$(count_file_value "$MOCK_STATE/doctor_count")
+  assert_eq 1 "$doctors" "unhealthy recovery should run generic doctor preflight once"
+}
+
 test_concurrency_pressure() {
   set_listener_state 0 0 none 0
   echo "0.2" > "$MOCK_STATE/start_delay_sec"
@@ -442,6 +484,9 @@ main() {
   run_test "invalid_config_rollback_backup" test_invalid_config_rollback_backup
   run_test "stale_lock_recovery" test_stale_lock_recovery
   run_test "without_jq_fallback" test_without_jq_fallback
+  run_test "subagents_key_auto_sanitized" test_subagents_key_auto_sanitized
+  run_test "start_failure_triggers_doctor_fallback" test_start_failure_triggers_doctor_fallback
+  run_test "unhealthy_path_runs_generic_doctor_preflight" test_unhealthy_path_runs_generic_doctor_preflight
   run_test "concurrency_pressure" test_concurrency_pressure
 
   echo "----"

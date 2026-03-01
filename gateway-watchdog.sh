@@ -18,6 +18,8 @@ CONFIG_BACKUP="$OPENCLAW_DIR/openclaw.json.watchdog-backup"
 PLIST="$HOME/Library/LaunchAgents/ai.openclaw.gateway.plist"
 STATE_DIR="$OPENCLAW_DIR/.watchdog"
 LOCK_FILE="$STATE_DIR/watchdog.lock"
+DOCTOR_TS_FILE="$STATE_DIR/last_doctor_fix.ts"
+DOCTOR_COOLDOWN_SEC=300
 USER_UID=$(id -u)
 
 mkdir -p "$LOG_DIR" "$STATE_DIR"
@@ -57,6 +59,34 @@ run_cmd_logged() {
     log "[命令失败] $label (exit=$rc): $(trim_text "$out")"
   fi
   return "$rc"
+}
+
+read_int_file_or_zero() {
+  local file="$1"
+  local v
+  v=$(cat "$file" 2>/dev/null || echo 0)
+  if echo "$v" | grep -Eq '^[0-9]+$'; then
+    echo "$v"
+  else
+    echo 0
+  fi
+}
+
+run_doctor_fix_with_cooldown() {
+  local force="${1:-0}"
+  local now last age
+
+  now=$(date +%s)
+  last=$(read_int_file_or_zero "$DOCTOR_TS_FILE")
+  age=$((now - last))
+
+  if [ "$force" -ne 1 ] && [ "$last" -gt 0 ] && [ "$age" -lt "$DOCTOR_COOLDOWN_SEC" ]; then
+    return 0
+  fi
+
+  run_cmd_logged "openclaw doctor --fix --non-interactive --yes" \
+    "$OPENCLAW" doctor --fix --non-interactive --yes || true
+  echo "$now" > "$DOCTOR_TS_FILE" 2>/dev/null || true
 }
 
 cleanup_lock() {
@@ -185,6 +215,60 @@ PY
   fi
 }
 
+json_has_top_level_key() {
+  local file="$1"
+  local key="$2"
+  if has_jq; then
+    jq -e --arg k "$key" 'has($k)' "$file" >/dev/null 2>&1
+  else
+    python3 - "$file" "$key" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+
+path, key = sys.argv[1], sys.argv[2]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+if isinstance(data, dict) and key in data:
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+  fi
+}
+
+json_delete_top_level_key() {
+  local file="$1"
+  local key="$2"
+  local tmp="$file.tmp.$$"
+
+  if has_jq; then
+    jq --arg k "$key" 'del(.[$k])' "$file" > "$tmp" || {
+      rm -f "$tmp"
+      return 1
+    }
+  else
+    if ! python3 - "$file" "$tmp" "$key" <<'PY'
+import json
+import sys
+
+src, dst, key = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src, "r", encoding="utf-8") as f:
+    data = json.load(f)
+if not isinstance(data, dict):
+    raise SystemExit(1)
+data.pop(key, None)
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+    then
+      rm -f "$tmp"
+      return 1
+    fi
+  fi
+
+  mv "$tmp" "$file"
+}
+
 json_set_typing_mode_message() {
   local file="$1"
   local tmp="$file.tmp.$$"
@@ -252,6 +336,17 @@ sanitize_known_config_issues() {
 
   [ -f "$file" ] || return 1
   json_validate_file "$file" || return 1
+
+  # OpenClaw 2026.x no longer accepts top-level subagents; keep config schema-safe.
+  if json_has_top_level_key "$file" "subagents"; then
+    if json_delete_top_level_key "$file" "subagents"; then
+      log_event "${label}配置含未知字段(subagents)" "自动移除subagents" "成功"
+      chmod 600 "$file" 2>/dev/null || true
+    else
+      log_event "${label}配置含未知字段(subagents)" "自动移除subagents" "失败"
+      return 1
+    fi
+  fi
 
   mode=$(json_get_typing_mode "$file")
   if ! is_typing_mode_valid "$mode"; then
@@ -322,12 +417,25 @@ refresh_backup_if_safe() {
 }
 
 recover_config() {
+  local pre_valid=0
+
   sanitize_known_config_issues "$CONFIG" "当前" || true
   if config_quick_validate "$CONFIG"; then
+    pre_valid=1
+  fi
+
+  # Generic repair path for evolving config schema; not tied to any single key.
+  run_doctor_fix_with_cooldown 0
+  sanitize_known_config_issues "$CONFIG" "当前" || true
+  if config_quick_validate "$CONFIG"; then
+    if [ "$pre_valid" -eq 0 ]; then
+      log_event "检测到当前配置无效" "doctor --fix/自动修正" "成功"
+    fi
     return 0
   fi
 
-  run_cmd_logged "openclaw doctor --fix" "$OPENCLAW" doctor --fix || true
+  # If basic validation still fails, force doctor once more before rollback.
+  run_doctor_fix_with_cooldown 1
   sanitize_known_config_issues "$CONFIG" "当前" || true
   if config_quick_validate "$CONFIG"; then
     log_event "检测到当前配置无效" "doctor --fix/自动修正" "成功"
@@ -366,6 +474,12 @@ start_gateway() {
   fi
 
   run_cmd_logged "openclaw gateway start --force" "$OPENCLAW" gateway start --force || true
+  probe_gateway_ready && return 0
+
+  # Last chance: refresh config with doctor and retry once.
+  run_doctor_fix_with_cooldown 1
+  sanitize_known_config_issues "$CONFIG" "当前" || true
+  run_cmd_logged "openclaw gateway start --force(doctor后)" "$OPENCLAW" gateway start --force || true
   probe_gateway_ready
 }
 
